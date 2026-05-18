@@ -164,4 +164,232 @@ def tool_world_clock(timezone: str) -> str:
         return f"Current time in {timezone}: {now.strftime('%A, %d %B %Y  %H:%M:%S %Z')}"
     except Exception:
         now = datetime.datetime.utcnow()
-        return f"UTC
+        return f"UTC time: {now.strftime('%A, %d %B %Y  %H:%M:%S')} (could not resolve '{timezone}')"
+
+
+def tool_web_search(query: str) -> str:
+    try:
+        url = f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}&format=json&no_html=1&skip_disambig=1"
+        with urllib.request.urlopen(url, timeout=6) as r:
+            data = json.loads(r.read())
+        parts = []
+        if data.get("AbstractText"):
+            parts.append(data["AbstractText"])
+        if data.get("Answer"):
+            parts.append(f"Answer: {data['Answer']}")
+        for topic in data.get("RelatedTopics", [])[:3]:
+            if isinstance(topic, dict) and topic.get("Text"):
+                parts.append(f"• {topic['Text']}")
+        return "\n".join(parts) if parts else f"No instant answer found for '{query}'."
+    except Exception as e:
+        return f"Search error: {e}"
+
+
+def run_tool(name: str, args: dict) -> str:
+    if name == "calculator":
+        return tool_calculator(args["expression"])
+    elif name == "weather":
+        return tool_weather(args["city"])
+    elif name == "currency_convert":
+        return tool_currency(args["amount"], args["from_currency"], args["to_currency"])
+    elif name == "world_clock":
+        return tool_world_clock(args["timezone"])
+    elif name == "web_search":
+        return tool_web_search(args["query"])
+    return "Unknown tool."
+
+
+# ─────────────────────────────────────────
+# Dynamic Tool declarations 
+# ─────────────────────────────────────────
+active_tools = []
+
+if use_calc:
+    active_tools.append(
+        types.FunctionDeclaration(
+            name="calculator",
+            description="Evaluate a mathematical expression. Use for any arithmetic or math calculations.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "expression": types.Schema(
+                        type=types.Type.STRING,
+                        description="Math expression e.g. '2 ** 10' or 'sqrt(144)'"
+                    )
+                },
+                required=["expression"]
+            )
+        )
+    )
+
+if use_weather:
+    active_tools.append(
+        types.FunctionDeclaration(
+            name="weather",
+            description="Get current weather for any city in the world.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "city": types.Schema(
+                        type=types.Type.STRING,
+                        description="City name e.g. 'London' or 'Kathmandu'"
+                    )
+                },
+                required=["city"]
+            )
+        )
+    )
+
+if use_currency:
+    active_tools.append(
+        types.FunctionDeclaration(
+            name="currency_convert",
+            description="Convert an amount from one currency to another.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "amount":        types.Schema(type=types.Type.NUMBER,  description="Amount to convert"),
+                    "from_currency": types.Schema(type=types.Type.STRING,  description="Source currency code e.g. USD"),
+                    "to_currency":   types.Schema(type=types.Type.STRING,  description="Target currency code e.g. GBP"),
+                },
+                required=["amount", "from_currency", "to_currency"]
+            )
+        )
+    )
+
+if use_clock:
+    active_tools.append(
+        types.FunctionDeclaration(
+            name="world_clock",
+            description="Get the current date and time in any timezone.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "timezone": types.Schema(
+                        type=types.Type.STRING,
+                        description="IANA timezone e.g. 'Europe/London' or 'Asia/Kathmandu'"
+                    )
+                },
+                required=["timezone"]
+            )
+        )
+    )
+
+if use_search:
+    active_tools.append(
+        types.FunctionDeclaration(
+            name="web_search",
+            description="Search the web for current information, news, or facts.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "query": types.Schema(type=types.Type.STRING, description="Search query")
+                },
+                required=["query"]
+            )
+        )
+    )
+
+# Wrap dynamically built tool definitions inside Gemini Tool schema
+TOOLS = [types.Tool(function_declarations=active_tools)] if active_tools else []
+
+SYSTEM_PROMPT = """You are a helpful personal AI assistant with access to real-world tools.
+Use tools whenever they would give a better, more accurate answer.
+Be concise, friendly, and practical. Format responses clearly using markdown where helpful."""
+
+# ─────────────────────────────────────────
+# Chat state
+# ─────────────────────────────────────────
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Render chat history
+for msg in st.session_state.messages:
+    if isinstance(msg.get("content"), str):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+# ─────────────────────────────────────────
+# Chat input
+# ─────────────────────────────────────────
+user_input = st.chat_input("Ask me anything...")
+
+if user_input:
+    if not api_key:
+        st.warning("Please enter your Gemini API key in the sidebar.")
+        st.stop()
+
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    # Reconstruct history blocks for Gemini
+    contents = []
+    for m in st.session_state.messages:
+        if m["role"] == "user":
+            contents.append(types.Content(role="user", parts=[types.Part(text=m["content"])]))
+        elif m["role"] == "assistant":
+            contents.append(types.Content(role="model", parts=[types.Part(text=m["content"])]))
+        elif m["role"] == "raw_interaction":
+            contents.extend(m["content"])
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            try:
+                client = genai.Client(api_key=api_key)
+
+                # Agentic loop
+                while True:
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            tools=TOOLS,
+                        )
+                    )
+
+                    candidate = response.candidates[0].content
+
+                    # Check if any part is a function call
+                    fn_calls = [p for p in candidate.parts if p.function_call is not None]
+
+                    if fn_calls:
+                        contents.append(candidate)
+                        st.session_state.messages.append({"role": "raw_interaction", "content": [candidate]})
+
+                        # Execute each tool and collect results
+                        tool_result_parts = []
+                        for part in fn_calls:
+                            fn_name = part.function_call.name
+                            fn_args = dict(part.function_call.args)
+
+                            st.markdown(
+                                f'<div class="tool-call">🔧 Using tool: <b>{fn_name}</b> — {fn_args}</div>',
+                                unsafe_allow_html=True
+                            )
+
+                            result = run_tool(fn_name, fn_args)
+                            tool_result_parts.append(
+                                types.Part(
+                                    function_response=types.FunctionResponse(
+                                        name=fn_name,
+                                        response={"result": result}
+                                    )
+                                )
+                            )
+
+                        tool_content = types.Content(role="user", parts=tool_result_parts)
+                        
+                        contents.append(tool_content)
+                        st.session_state.messages.append({"role": "raw_interaction", "content": [tool_content]})
+
+                    else:
+                        # Final text answer
+                        final = response.text
+                        st.markdown(final)
+                        st.session_state.messages.append({"role": "assistant", "content": final})
+                        break
+
+            except Exception as e:
+                st.error(f"Error: {e}")
