@@ -60,7 +60,7 @@ with st.sidebar:
         st.markdown("[Get a FREE Gemini API key](https://aistudio.google.com/app/apikey)")
 
     st.divider()
-    st.markdown("**Model:** Gemini 1.5 Flash ⚡")
+    st.markdown("**Model:** Gemini 2.5 Flash ⚡")
     st.markdown("**Free tier:** 15 req/min · 1,500 req/day")
     st.divider()
     st.markdown("**Tools available:**")
@@ -283,8 +283,10 @@ if "messages" not in st.session_state:
 
 # Render chat history
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    # Only render visible chat items (ignoring complex API objects if any slipped in)
+    if isinstance(msg.get("content"), str):
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
 # ─────────────────────────────────────────
 # Chat input
@@ -300,26 +302,26 @@ if user_input:
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Build history for Gemini
-    history = []
-    for m in st.session_state.messages[:-1]:
-        role = "user" if m["role"] == "user" else "model"
-        history.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
+    # Reconstruct raw history blocks for Gemini
+    contents = []
+    for m in st.session_state.messages:
+        if m["role"] == "user":
+            contents.append(types.Content(role="user", parts=[types.Part(text=m["content"])]))
+        elif m["role"] == "assistant":
+            contents.append(types.Content(role="model", parts=[types.Part(text=m["content"])]))
+        elif m["role"] == "raw_interaction":
+            # Appends raw function_calls or function_responses to preserve history structure
+            contents.extend(m["content"])
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             try:
                 client = genai.Client(api_key=api_key)
 
-                # Start with user message
-                contents = history + [
-                    types.Content(role="user", parts=[types.Part(text=user_input)])
-                ]
-
                 # Agentic loop
                 while True:
                     response = client.models.generate_content(
-                        model="gemini-1.5-flash",
+                        model="gemini-2.5-flash",
                         contents=contents,
                         config=types.GenerateContentConfig(
                             system_instruction=SYSTEM_PROMPT,
@@ -333,8 +335,10 @@ if user_input:
                     fn_calls = [p for p in candidate.parts if p.function_call is not None]
 
                     if fn_calls:
-                        # Add model response to contents
+                        # Append model intent to active scope
                         contents.append(candidate)
+                        # Save the model's tool intent to st.session_state to avoid breaking future context
+                        st.session_state.messages.append({"role": "raw_interaction", "content": [candidate]})
 
                         # Execute each tool and collect results
                         tool_result_parts = []
@@ -357,8 +361,11 @@ if user_input:
                                 )
                             )
 
-                        # Add tool results back
-                        contents.append(types.Content(role="user", parts=tool_result_parts))
+                        tool_content = types.Content(role="user", parts=tool_result_parts)
+                        
+                        # Feed result back to running context and history
+                        contents.append(tool_content)
+                        st.session_state.messages.append({"role": "raw_interaction", "content": [tool_content]})
 
                     else:
                         # Final text answer
